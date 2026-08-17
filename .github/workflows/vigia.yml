@@ -48,8 +48,8 @@ jobs:
 
           if [ -n "$fallas" ]; then
             echo "FALLAS detectadas"
-            avisar "🛰️ VIGÍA EXTERNO (GitHub): algo no responde:
-${fallas}Seguiré avisando cada ~10 min mientras siga así."
+            msg=$(printf '🛰️ VIGÍA EXTERNO (GitHub): algo no responde:\n%sSeguiré avisando cada ~10 min mientras siga así.' "$fallas")
+            avisar "$msg"
             exit 1
           fi
           if [ "${TEST_ALERT:-no}" = "si" ] || [ "${TEST_ALERT:-no}" = "yes" ]; then
