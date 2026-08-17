@@ -1,0 +1,58 @@
+name: vigia
+# Monitor externo (capa de respaldo del monitor local): si n8n o los portales no
+# responden, avisa por Telegram. Corre cada 10 min; durante una caída real vuelve
+# a avisar en cada corrida (~10 min) hasta que se recupere — es intencional.
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+    inputs:
+      test_alert:
+        description: "Mandar un Telegram de PRUEBA aunque todo esté bien"
+        required: false
+        default: "no"
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checar servicios
+        env:
+          TG_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TG_CHAT: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TEST_ALERT: ${{ github.event.inputs.test_alert }}
+        run: |
+          set -u
+          fallas=""
+          chk () { # nombre url codigo_esperado
+            local code
+            for i in 1 2 3; do
+              code=$(curl -s -o /dev/null -m 15 -w '%{http_code}' "$2" || echo 000)
+              [ "$code" = "$3" ] && return 0
+              sleep 10
+            done
+            fallas="${fallas}• $1 → $code (esperado $3)"$'\n'
+            return 1
+          }
+          chk "n8n healthz"        "https://n8n.satorimkt.com/healthz" 200 || true
+          chk "portal OPS login"   "https://ops.satoriagency.com.mx/login" 200 || true
+          chk "sitio satorimkt"    "https://satorimkt.com/" 200 || true
+
+          avisar () {
+            curl -s -m 20 "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" \
+              --data-urlencode "chat_id=${TG_CHAT}" \
+              --data-urlencode "text=$1" -o /dev/null
+          }
+
+          if [ -n "$fallas" ]; then
+            echo "FALLAS detectadas"
+            avisar "🛰️ VIGÍA EXTERNO (GitHub): algo no responde:
+${fallas}Seguiré avisando cada ~10 min mientras siga así."
+            exit 1
+          fi
+          if [ "${TEST_ALERT:-no}" = "si" ] || [ "${TEST_ALERT:-no}" = "yes" ]; then
+            avisar "🛰️ PRUEBA del vigía externo (GitHub Actions) — todo verde. Ignorar."
+          fi
+          echo "todo verde"
