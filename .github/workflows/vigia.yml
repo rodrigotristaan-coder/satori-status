@@ -97,8 +97,13 @@ jobs:
           fi
 
           # ── 3. Qué pasó en las 2 corridas anteriores ────────────────────────
-          conclusiones=$(gh run list --workflow vigia.yml --status completed \
-                          --limit 2 --json conclusion --jq '.[].conclusion' 2>/dev/null || echo "")
+          # OJO: este workflow NO hace checkout, así que `gh` no puede inferir el repo
+          # del remoto de git — hay que pasarle -R a mano o devuelve vacío EN SILENCIO
+          # (y sin estado previo la confirmación nunca dispara: el vigía se queda mudo).
+          # Lo cazó el disparo de prueba del 2026-08-22; el stderr se deja visible.
+          conclusiones=$(gh run list -R "$GITHUB_REPOSITORY" --workflow vigia.yml \
+                          --status completed --limit 2 --json conclusion \
+                          --jq '.[].conclusion' || echo "")
           prev=$(echo "$conclusiones"  | sed -n '1p')
           prev2=$(echo "$conclusiones" | sed -n '2p')
           echo "corridas previas → prev=${prev:-ninguna} prev2=${prev2:-ninguna}"
