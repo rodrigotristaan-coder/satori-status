@@ -1,7 +1,29 @@
 name: vigia
-# Monitor externo (capa de respaldo del monitor local): si n8n o los portales no
-# responden, avisa por Telegram. Corre cada 10 min; durante una caída real vuelve
-# a avisar en cada corrida (~10 min) hasta que se recupere — es intencional.
+# Monitor externo (capa de respaldo del monitor local de la Mac). Corre cada 10 min
+# desde fuera de nuestra infra y avisa por Telegram si algo deja de responder.
+#
+# ── Diseño de RUIDO (reescrito 2026-08-22) ────────────────────────────────────
+# Antes avisaba en la PRIMERA corrida fallida y NUNCA mandaba recuperación.
+# Medido sobre 60 corridas (19→21-ago): 6 fallos, TODOS aislados y recuperados en
+# la corrida siguiente ⇒ 6 alarmas de madrugada que nadie podía cerrar, y ninguna
+# era una caída real (el VPS estaba en load 0.00, sin reinicios de contenedor).
+# Eso entrena a ignorar al vigía, que es justo lo contrario de para qué existe.
+#
+# Ahora, copiando el patrón del monitor local (~/satori-monitor/n8n-monitor.sh):
+#   1. CONFIRMACIÓN: avisa solo si el fallo se repite en 2 corridas seguidas (~20 min).
+#      Con los datos medidos, esto habría silenciado las 6 alarmas falsas sin perder
+#      una sola caída real. Es la capa de respaldo: 10 min de retraso está bien.
+#   2. RECUPERADO: cuando vuelve, lo dice. Ninguna alarma queda abierta.
+#   3. CONTROL DE RED: si la red del propio runner de GitHub está rota, no culpa a
+#      los servicios (mismo truco que el monitor local con generate_204).
+#   4. Mensajes con HORA DE MÉXICO y códigos en español ("no respondió" en vez de 000).
+#   5. El log de la corrida imprime QUÉ falló — antes solo decía "FALLAS detectadas"
+#      y el detalle viajaba únicamente en el Telegram, así que el historial no se
+#      podía diagnosticar después.
+#
+# El estado entre corridas sale de la conclusión de las 2 corridas anteriores
+# (`gh run list`), así que no hay que guardar nada ni commitear ficheros de estado.
+#   failure = esa corrida vio fallas · 2 failures seguidos = ya estábamos avisando.
 
 on:
   schedule:
@@ -13,6 +35,10 @@ on:
         required: false
         default: "no"
 
+permissions:
+  actions: read # leer la conclusión de las corridas anteriores
+  contents: read
+
 jobs:
   check:
     runs-on: ubuntu-latest
@@ -23,22 +49,10 @@ jobs:
           TG_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TG_CHAT: ${{ secrets.TELEGRAM_CHAT_ID }}
           TEST_ALERT: ${{ github.event.inputs.test_alert }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -u
-          fallas=""
-          chk () { # nombre url codigo_esperado
-            local code
-            for i in 1 2 3; do
-              code=$(curl -s -o /dev/null -m 15 -w '%{http_code}' "$2" || echo 000)
-              [ "$code" = "$3" ] && return 0
-              sleep 10
-            done
-            fallas="${fallas}• $1 → $code (esperado $3)"$'\n'
-            return 1
-          }
-          chk "n8n healthz"        "https://n8n.satorimkt.com/healthz" 200 || true
-          chk "portal OPS login"   "https://ops.satoriagency.com.mx/login" 200 || true
-          chk "sitio satorimkt"    "https://satorimkt.com/" 200 || true
+          ahora=$(TZ=America/Mexico_City date '+%d-%b %H:%M')
 
           avisar () {
             curl -s -m 20 "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" \
@@ -46,13 +60,66 @@ jobs:
               --data-urlencode "text=$1" -o /dev/null
           }
 
+          # ── 1. Sondeo ───────────────────────────────────────────────────────
+          fallas=""
+          humano () { # codigo esperado -> texto para un humano
+            case "$1" in
+              000) echo "no respondió (timeout)" ;;
+              *)   echo "contestó $1 y se esperaba $2" ;;
+            esac
+          }
+          chk () { # nombre url codigo_esperado
+            local code=000
+            for i in 1 2 3; do
+              code=$(curl -s -o /dev/null -m 15 -w '%{http_code}' "$2" || echo 000)
+              [ "$code" = "$3" ] && return 0
+              sleep 10
+            done
+            fallas="${fallas}• $1 → $(humano "$code" "$3")"$'\n'
+            return 1
+          }
+          chk "n8n"            "https://n8n.satorimkt.com/healthz"      200 || true
+          chk "portal OPS"     "https://ops.satoriagency.com.mx/login"  200 || true
+          chk "satorimkt.com"  "https://satorimkt.com/"                 200 || true
+
+          if [ "${TEST_ALERT:-no}" = "si" ] || [ "${TEST_ALERT:-no}" = "yes" ]; then
+            avisar "🛰️ PRUEBA del vigía externo — llegó bien. Ignorar. ($ahora)"
+          fi
+
+          # ── 2. ¿Es la red del runner, o son los servicios? ───────────────────
           if [ -n "$fallas" ]; then
-            echo "FALLAS detectadas"
-            msg=$(printf '🛰️ VIGÍA EXTERNO (GitHub): algo no responde:\n%sSeguiré avisando cada ~10 min mientras siga así.' "$fallas")
-            avisar "$msg"
+            ctl=$(curl -s -o /dev/null -m 10 -w '%{http_code}' https://www.google.com/generate_204 || echo 000)
+            if [ "$ctl" != "204" ] && [ "$ctl" != "200" ]; then
+              echo "RED DEL RUNNER caída (control=$ctl). No se culpa a los servicios."
+              echo "$fallas"
+              exit 0
+            fi
+          fi
+
+          # ── 3. Qué pasó en las 2 corridas anteriores ────────────────────────
+          conclusiones=$(gh run list --workflow vigia.yml --status completed \
+                          --limit 2 --json conclusion --jq '.[].conclusion' 2>/dev/null || echo "")
+          prev=$(echo "$conclusiones"  | sed -n '1p')
+          prev2=$(echo "$conclusiones" | sed -n '2p')
+          echo "corridas previas → prev=${prev:-ninguna} prev2=${prev2:-ninguna}"
+
+          # ── 4. Decidir ──────────────────────────────────────────────────────
+          if [ -n "$fallas" ]; then
+            echo "FALLAS detectadas:"
+            echo "$fallas"
+            if [ "$prev" = "failure" ]; then
+              avisar "$(printf '🔴 CAÍDO (%s) — dos corridas seguidas sin respuesta:\n%sSeguiré avisando cada ~10 min hasta que vuelva.' "$ahora" "$fallas")"
+              echo "→ AVISADO por Telegram (confirmado en 2 corridas)."
+            else
+              echo "→ Primer tropiezo: NO se avisa todavía. Si la próxima corrida también falla, se avisa."
+            fi
             exit 1
           fi
-          if [ "${TEST_ALERT:-no}" = "si" ] || [ "${TEST_ALERT:-no}" = "yes" ]; then
-            avisar "🛰️ PRUEBA del vigía externo (GitHub Actions) — todo verde. Ignorar."
+
+          if [ "$prev" = "failure" ] && [ "$prev2" = "failure" ]; then
+            avisar "✅ RECUPERADO ($ahora) — los 3 servicios responden otra vez."
+            echo "→ RECUPERADO avisado por Telegram."
+          elif [ "$prev" = "failure" ]; then
+            echo "→ El tropiezo anterior fue aislado y ya pasó. No se avisó nada, no hay nada que cerrar."
           fi
           echo "todo verde"
