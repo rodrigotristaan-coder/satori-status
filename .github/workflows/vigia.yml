@@ -79,7 +79,6 @@ jobs:
             return 1
           }
           chk "n8n"            "https://n8n.satorimkt.com/healthz"      200 || true
-          chk "portal OPS"     "https://ops.satoriagency.com.mx/login"  200 || true
           chk "satorimkt.com"  "https://satorimkt.com/"                 200 || true
 
           if [ "${TEST_ALERT:-no}" = "si" ] || [ "${TEST_ALERT:-no}" = "yes" ]; then
@@ -122,7 +121,7 @@ jobs:
           fi
 
           if [ "$prev" = "failure" ] && [ "$prev2" = "failure" ]; then
-            avisar "✅ RECUPERADO ($ahora) — los 3 servicios responden otra vez."
+            avisar "✅ RECUPERADO ($ahora) — los servicios responden otra vez."
             echo "→ RECUPERADO avisado por Telegram."
           elif [ "$prev" = "failure" ]; then
             echo "→ El tropiezo anterior fue aislado y ya pasó. No se avisó nada, no hay nada que cerrar."
